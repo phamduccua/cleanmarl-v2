@@ -62,6 +62,8 @@ class Args:
     """ 0< for no clipping and 0> if clipping at clip_gradients"""
     eval_steps: int = 10
     """ Evaluate the policy each «eval_steps» training steps"""
+    vi_tau: float = 0.1
+    """ Tau for VIOptimizer regularization (ignored in MAPPO)"""
     num_eval_ep: int = 10
     """ Number of evaluation episodes"""
     use_wnb: bool = False
