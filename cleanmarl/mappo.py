@@ -7,9 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from dataclasses import dataclass
 import torch.nn.functional as F
-from env.pettingzoo_wrapper import PettingZooWrapper
-from env.smaclite_wrapper import SMACliteWrapper
-from env.lbf import LBFWrapper
+import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
@@ -76,6 +74,18 @@ class Args:
     """ Device (cpu, cuda, mps)"""
     seed: int = 1
     """ Random seed"""
+    approx_nashconv: bool = False
+    """ Log an approximate NashConv metric during evaluation if True"""
+    approx_nashconv_br_updates: int = 5
+    """ Number of temporary best-response updates per agent"""
+    approx_nashconv_br_episodes: int = 4
+    """ Episodes collected for each temporary best-response update"""
+    approx_nashconv_eval_episodes: int = 5
+    """ Evaluation episodes used for each approximate Nash gap"""
+    approx_nashconv_learning_rate: float = 0.0003
+    """ Learning rate for the temporary best-response actor"""
+    approx_nashconv_deterministic_eval: bool = True
+    """ Use greedy actions when evaluating approximate Nash gaps"""
 
 
 class RolloutBuffer:
@@ -206,12 +216,18 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 def environment(env_type, env_name, env_family, agent_ids, kwargs):
     if env_type == "pz":
+        from env.pettingzoo_wrapper import PettingZooWrapper
+
         env = PettingZooWrapper(
             family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs
         )
     elif env_type == "smaclite":
+        from env.smaclite_wrapper import SMACliteWrapper
+
         env = SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "lbf":
+        from env.lbf import LBFWrapper
+
         env = LBFWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
 
     return env
@@ -221,6 +237,204 @@ def norm_d(grads, d):
     norms = [torch.linalg.vector_norm(g.detach(), d) for g in grads]
     total_norm_d = torch.linalg.vector_norm(torch.tensor(norms), d)
     return total_norm_d
+
+
+def get_step_utilities(env, reward):
+    if hasattr(env, "get_last_reward_vector"):
+        reward_vector = np.asarray(env.get_last_reward_vector(), dtype=np.float32)
+        if reward_vector.shape[0] == env.n_agents:
+            return reward_vector
+    reward_array = np.asarray(reward, dtype=np.float32)
+    if reward_array.ndim == 0:
+        return np.full(env.n_agents, float(reward_array), dtype=np.float32)
+    if reward_array.shape[0] == env.n_agents:
+        return reward_array
+    return np.full(env.n_agents, float(reward_array.mean()), dtype=np.float32)
+
+
+def get_team_reward(env, reward):
+    return float(get_step_utilities(env, reward).sum())
+
+
+def build_actor(env, args, device):
+    return Actor(
+        input_dim=env.get_obs_size(),
+        hidden_dim=args.actor_hidden_dim,
+        num_layer=args.actor_num_layers,
+        output_dim=env.get_action_size(),
+    ).to(device)
+
+
+def hybrid_policy_action(
+    actor,
+    obs,
+    avail_actions,
+    device,
+    deterministic=False,
+    override_actor=None,
+    override_agent_idx=None,
+):
+    obs_tensor = torch.from_numpy(obs).float().to(device)
+    avail_tensor = torch.from_numpy(avail_actions).bool().to(device)
+    actions = []
+    log_probs = []
+    entropies = []
+    n_agents = obs_tensor.size(0)
+    for agent_idx in range(n_agents):
+        current_actor = actor
+        if override_actor is not None and override_agent_idx == agent_idx:
+            current_actor = override_actor
+        logits = current_actor.logits(
+            obs_tensor[agent_idx].unsqueeze(0),
+            avail_tensor[agent_idx].unsqueeze(0),
+        ).squeeze(0)
+        dist = Categorical(logits=logits)
+        if deterministic:
+            action = torch.argmax(logits, dim=-1)
+        else:
+            action = dist.sample()
+        actions.append(action)
+        log_probs.append(dist.log_prob(action))
+        entropies.append(dist.entropy())
+    return torch.stack(actions), torch.stack(log_probs), torch.stack(entropies)
+
+
+def evaluate_policy_utilities(
+    eval_env,
+    actor,
+    device,
+    num_episodes,
+    deterministic=False,
+    override_actor=None,
+    override_agent_idx=None,
+):
+    episodic_utilities = []
+    for _ in range(num_episodes):
+        obs, _ = eval_env.reset()
+        done = False
+        truncated = False
+        ep_utility = np.zeros(eval_env.n_agents, dtype=np.float64)
+        while not done and not truncated:
+            avail_action = eval_env.get_avail_actions()
+            with torch.no_grad():
+                actions, _, _ = hybrid_policy_action(
+                    actor,
+                    obs,
+                    avail_action,
+                    device,
+                    deterministic=deterministic,
+                    override_actor=override_actor,
+                    override_agent_idx=override_agent_idx,
+                )
+            obs, reward, done, truncated, _ = eval_env.step(actions.cpu().numpy())
+            ep_utility += get_step_utilities(eval_env, reward)
+        episodic_utilities.append(ep_utility)
+    return np.mean(episodic_utilities, axis=0)
+
+
+def train_best_response_actor(args, kwargs, actor, agent_idx, device):
+    br_env = environment(
+        env_type=args.env_type,
+        env_name=args.env_name,
+        env_family=args.env_family,
+        agent_ids=args.agent_ids,
+        kwargs=kwargs,
+    )
+    br_actor = build_actor(br_env, args, device)
+    br_actor.load_state_dict(actor.state_dict())
+    optimizer_cls = getattr(optim, args.optimizer)
+    br_optimizer = optimizer_cls(br_actor.parameters(), lr=args.approx_nashconv_learning_rate)
+    try:
+        for _ in range(args.approx_nashconv_br_updates):
+            batch_log_probs, batch_returns, batch_entropies = [], [], []
+            for _ in range(args.approx_nashconv_br_episodes):
+                obs, _ = br_env.reset()
+                done = False
+                truncated = False
+                ep_rewards, ep_log_probs, ep_entropies = [], [], []
+                while not done and not truncated:
+                    actions, log_probs, entropies = hybrid_policy_action(
+                        actor,
+                        obs,
+                        br_env.get_avail_actions(),
+                        device,
+                        deterministic=False,
+                        override_actor=br_actor,
+                        override_agent_idx=agent_idx,
+                    )
+                    obs, reward, done, truncated, _ = br_env.step(actions.cpu().numpy())
+                    ep_rewards.append(float(get_step_utilities(br_env, reward)[agent_idx]))
+                    ep_log_probs.append(log_probs[agent_idx])
+                    ep_entropies.append(entropies[agent_idx])
+                last_return = 0.0
+                ep_returns = []
+                for reward_t in reversed(ep_rewards):
+                    last_return = reward_t + args.gamma * last_return
+                    ep_returns.append(last_return)
+                batch_returns.extend(reversed(ep_returns))
+                batch_log_probs.extend(ep_log_probs)
+                batch_entropies.extend(ep_entropies)
+            if not batch_log_probs:
+                continue
+            returns = torch.tensor(batch_returns, dtype=torch.float32, device=device)
+            if returns.numel() > 1:
+                returns = (returns - returns.mean()) / (returns.std(unbiased=False) + 1e-6)
+            loss = -(torch.stack(batch_log_probs) * returns).mean()
+            loss -= args.entropy_coef * torch.stack(batch_entropies).mean()
+            br_optimizer.zero_grad()
+            loss.backward()
+            if args.clip_gradients > 0:
+                torch.nn.utils.clip_grad_norm_(br_actor.parameters(), max_norm=args.clip_gradients)
+            br_optimizer.step()
+    finally:
+        br_env.close()
+    return br_actor
+
+
+def compute_approx_nashconv(args, kwargs, actor, device, n_agents):
+    base_eval_env = environment(
+        env_type=args.env_type,
+        env_name=args.env_name,
+        env_family=args.env_family,
+        agent_ids=args.agent_ids,
+        kwargs=kwargs,
+    )
+    try:
+        base_utilities = evaluate_policy_utilities(
+            base_eval_env,
+            actor,
+            device,
+            args.approx_nashconv_eval_episodes,
+            deterministic=args.approx_nashconv_deterministic_eval,
+        )
+    finally:
+        base_eval_env.close()
+
+    gaps = []
+    for agent_idx in range(n_agents):
+        br_actor = train_best_response_actor(args, kwargs, actor, agent_idx, device)
+        br_eval_env = environment(
+            env_type=args.env_type,
+            env_name=args.env_name,
+            env_family=args.env_family,
+            agent_ids=args.agent_ids,
+            kwargs=kwargs,
+        )
+        try:
+            br_utilities = evaluate_policy_utilities(
+                br_eval_env,
+                actor,
+                device,
+                args.approx_nashconv_eval_episodes,
+                deterministic=args.approx_nashconv_deterministic_eval,
+                override_actor=br_actor,
+                override_agent_idx=agent_idx,
+            )
+        finally:
+            br_eval_env.close()
+        gaps.append(max(0.0, float(br_utilities[agent_idx] - base_utilities[agent_idx])))
+
+    return float(np.sum(gaps)), gaps, base_utilities
 
 
 if __name__ == "__main__":
@@ -560,6 +774,24 @@ if __name__ == "__main__":
                     np.mean([info["battle_won"] for info in eval_ep_stats]),
                     step,
                 )
+            if args.approx_nashconv:
+                approx_nashconv, approx_nash_gaps, base_utilities = compute_approx_nashconv(
+                    args, kwargs, actor, device, env.n_agents
+                )
+                writer.add_scalar("eval/approx_nashconv", approx_nashconv, step)
+                writer.add_scalar(
+                    "eval/approx_nashconv_max_gap", np.max(approx_nash_gaps), step
+                )
+                for agent_idx, gap in enumerate(approx_nash_gaps):
+                    writer.add_scalar(
+                        f"eval/approx_nash_gap_agent_{agent_idx}", gap, step
+                    )
+                    writer.add_scalar(
+                        f"eval/base_utility_agent_{agent_idx}",
+                        base_utilities[agent_idx],
+                        step,
+                    )
+
 
     writer.close()
     if args.use_wnb:
