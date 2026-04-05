@@ -28,7 +28,7 @@ class Args:
     """ Hidden dimension of actor network"""
     actor_num_layers: int = 1
     """ Number of hidden layers of actor network"""
-    critic_hidden_dim: int = 64
+    critic_hidden_dim: int = 32
     """ Hidden dimension of critic network"""
     critic_num_layers: int = 1
     """ Number of hidden layers of critic network"""
@@ -668,11 +668,11 @@ if __name__ == "__main__":
                 pg_loss = (
                     torch.min(pg_loss1[b_mask[:, t]], pg_loss2[b_mask[:, t]])
                     .mean(dim=-1)
-                    .sum()
+                    .mean()
                 )
 
                 # Compute entropy bonus
-                entropy_loss = current_dist.entropy()[b_mask[:, t]].mean(dim=-1).sum()
+                entropy_loss = current_dist.entropy()[b_mask[:, t]].mean(dim=-1).mean()
                 entropies += entropy_loss
                 actor_loss += -pg_loss - args.entropy_coef * entropy_loss
 
@@ -685,14 +685,14 @@ if __name__ == "__main__":
 
                 # track kl distance
                 b_kl_divergence = (
-                    ((ratio - 1) - log_ratio)[b_mask[:, t]].mean(dim=-1).sum()
+                    ((ratio - 1) - log_ratio)[b_mask[:, t]].mean(dim=-1).mean()
                 )
                 kl_divergence += b_kl_divergence
                 clipped_ratio += (
                     ((ratio - 1.0).abs() > args.ppo_clip)[b_mask[:, t]]
                     .float()
                     .mean(dim=-1)
-                    .sum()
+                    .mean()
                 )
 
             actor_loss /= b_mask.sum()
