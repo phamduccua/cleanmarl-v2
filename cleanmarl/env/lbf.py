@@ -9,6 +9,31 @@ from gymnasium.spaces import Tuple,flatdim
 class LBFWrapper(CommonInterface):
     def __init__(self,map_name, reward_aggr='sum',seed=0, time_limit=150, agent_ids=False,**kwargs):
         super().__init__()
+        try:
+            gym.spec(map_name)
+        except gym.error.NameNotFound:
+            import re
+            match = re.match(r"^Foraging(-2s)?-(\d+)x\d+-(\d+)p-(\d+)f(-coop)?(-ind)?(-pen)?-v3$", map_name)
+            if match:
+                po, s, p, f, coop, ind, pen = match.groups()
+                gym.register(
+                    id=map_name,
+                    entry_point="lbforaging.foraging:ForagingEnv",
+                    kwargs={
+                        "players": int(p),
+                        "min_player_level": 1,
+                        "max_player_level": 2,
+                        "field_size": (int(s), int(s)),
+                        "min_food_level": 1,
+                        "max_food_level": 1 if ind else None,
+                        "max_num_food": int(f),
+                        "sight": 2 if po else int(s),
+                        "max_episode_steps": 50,
+                        "force_coop": bool(coop),
+                        "grid_observation": False,
+                        "penalty": 0.1 if pen else 0.0,
+                    },
+                )
         self.env = gym.make(map_name,max_episode_steps=time_limit, **kwargs)
         self.env = TimeLimit(self.env, max_episode_steps=time_limit)
         self.agent_ids = agent_ids
