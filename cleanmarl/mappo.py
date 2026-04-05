@@ -546,7 +546,7 @@ if __name__ == "__main__":
                 episode["obs"].append(obs)
                 episode["actions"].append(actions.cpu())
                 episode["log_prob"].append(log_probs.cpu())
-                episode["reward"].append(reward)
+                episode["reward"].append(get_team_reward(env, reward))
                 episode["done"].append(done)
                 episode["avail_actions"].append(avail_action)
                 episode["states"].append(state)
