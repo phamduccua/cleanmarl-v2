@@ -540,7 +540,7 @@ if __name__ == "__main__":
                 next_obs, reward, done, truncated, infos = env.step(
                     actions.cpu().numpy()
                 )
-                ep_reward += reward
+                ep_reward += get_team_reward(env, reward)
                 ep_length += 1
                 step += 1
                 episode["obs"].append(obs)
@@ -756,7 +756,7 @@ if __name__ == "__main__":
                 next_obs_, reward, done, truncated, infos = eval_env.step(
                     actions.cpu().numpy()
                 )
-                current_reward += reward
+                current_reward += get_team_reward(eval_env, reward)
                 current_ep_length += 1
                 eval_obs = next_obs_
                 if done or truncated:
