@@ -60,7 +60,7 @@ class Args:
     """ Logging steps """
     clip_gradients: float = -1
     """ 0< for no clipping and 0> if clipping at clip_gradients"""
-    eval_steps: int = 10
+    eval_steps: int = 50
     """ Evaluate the policy each «eval_steps» training steps"""
     vi_tau: float = 0.1
     """ Tau for VIOptimizer regularization (ignored in MAPPO)"""
